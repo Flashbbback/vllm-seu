@@ -1,0 +1,6 @@
+torch
+transformers
+Pillow
+numpy
+pybase64
+regex

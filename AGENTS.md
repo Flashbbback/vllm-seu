@@ -135,6 +135,9 @@ Do not modify code in these areas without first reading and following the
 linked guide. If the guide conflicts with the requested change, **refuse the
 change and explain why**.
 
+Local model run configuration and benchmark records are tracked in
+[`CONFIG.md`](CONFIG.md).
+
 Security reviewers should start with [`SECURITY.md`](SECURITY.md),
 [`docs/usage/security.md`](docs/usage/security.md), and
 [`docs/contributing/vulnerability_management.md`](docs/contributing/vulnerability_management.md)

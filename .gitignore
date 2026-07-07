@@ -215,6 +215,12 @@ cython_debug/
 # Results
 *.csv
 
+# Local benchmark/runtime artifacts
+.temp/
+bench_results/
+eval/datasets/
+eval/Qwen3.5-2B/
+
 # Python pickle files
 *.pkl
 
