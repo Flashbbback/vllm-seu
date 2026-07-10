@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ class VLMModel:
 
     `backend="dummy"` is for demo-only smoke tests.
     `backend="transformers"` uses a local Hugging Face model directory.
+    `backend="vllm"` uses vLLM offline inference with local model weights.
     Participants can replace the internals while preserving `generate_with_metrics`.
     """
 
@@ -50,7 +52,10 @@ class VLMModel:
         self._tokenizer = None
         self._backend_name = "dummy"
 
-        if backend in {"auto", "transformers"}:
+        if backend == "vllm":
+            self._load_vllm_backend()
+            self._backend_name = "vllm"
+        elif backend in {"auto", "transformers"}:
             try:
                 self._load_transformers_backend()
                 self._backend_name = "transformers"
@@ -64,6 +69,14 @@ class VLMModel:
     @property
     def backend_name(self) -> str:
         return self._backend_name
+
+    def shutdown(self) -> None:
+        if self._backend_name != "vllm" or self._model is None:
+            return
+        self._model.shutdown()
+        self._vllm_loop.run_until_complete(asyncio.sleep(0))
+        self._vllm_loop.close()
+        self._model = None
 
     def generate_with_metrics(
         self,
@@ -79,6 +92,13 @@ class VLMModel:
                 image=image,
                 prompt=prompt,
                 generation_config=generation_config,
+            )
+        if self._backend_name == "vllm":
+            return self._generate_with_vllm(
+                image=image,
+                prompt=prompt,
+                generation_config=generation_config,
+                sample_id=sample_id,
             )
         return self._generate_with_dummy(
             prompt=prompt,
@@ -105,6 +125,33 @@ class VLMModel:
             device_map=self.device,
         ).eval()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
+
+    def _load_vllm_backend(self) -> None:
+        from transformers import AutoProcessor
+
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.v1.engine.async_llm import AsyncLLM
+
+        self._processor = AutoProcessor.from_pretrained(
+            self.model_path,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
+        self._vllm_loop = asyncio.new_event_loop()
+        engine_args = AsyncEngineArgs(
+            model=self.model_path,
+            tokenizer=self.model_path,
+            trust_remote_code=True,
+            dtype="float16",
+            max_model_len=2048,
+            max_num_seqs=16,
+            gpu_memory_utilization=0.80,
+            skip_mm_profiling=True,
+            limit_mm_per_prompt={"image": 1},
+        )
+        self._model = AsyncLLM.from_engine_args(engine_args)
+        self._tokenizer = self._model.tokenizer
+        self._vllm_request_index = 0
 
     def _load_dummy_backend(self, reason: str) -> None:
         self._dummy_reason = reason
@@ -188,6 +235,105 @@ class VLMModel:
             ttft_seconds=ttft,
             elapsed_seconds=end - start,
             meta={"backend": "transformers"},
+        )
+
+    def _generate_with_vllm(
+        self,
+        *,
+        image,
+        prompt: str,
+        generation_config: GenerationConfig,
+        sample_id: str,
+    ) -> GenerationResult:
+        return self._vllm_loop.run_until_complete(
+            self._generate_with_vllm_async(
+                image=image,
+                prompt=prompt,
+                generation_config=generation_config,
+                sample_id=sample_id,
+            )
+        )
+
+    async def _generate_with_vllm_async(
+        self,
+        *,
+        image,
+        prompt: str,
+        generation_config: GenerationConfig,
+        sample_id: str,
+    ) -> GenerationResult:
+        from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        rendered_prompt = self._processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        sampling_params = SamplingParams(
+            temperature=generation_config.temperature,
+            top_p=generation_config.top_p,
+            max_tokens=generation_config.max_new_tokens,
+            output_kind=RequestOutputKind.DELTA,
+        )
+        llm_input = {
+            "prompt": rendered_prompt,
+            "multi_modal_data": {"image": image},
+        }
+
+        start = time.perf_counter()
+        first_token_at = None
+        chunks: list[str] = []
+        token_count = 0
+        last_output = None
+        request_id = f"eval-{sample_id}-{self._vllm_request_index}"
+        self._vllm_request_index += 1
+        async for output in self._model.generate(
+            prompt=llm_input,
+            sampling_params=sampling_params,
+            request_id=request_id,
+        ):
+            now = time.perf_counter()
+            last_output = output
+            delta_tokens = sum(
+                len(completion.token_ids) for completion in output.outputs
+            )
+            if delta_tokens:
+                if first_token_at is None:
+                    first_token_at = now
+                token_count += delta_tokens
+            for completion in output.outputs:
+                if completion.text:
+                    chunks.append(completion.text)
+            if output.finished:
+                break
+        end = time.perf_counter()
+
+        if first_token_at is None:
+            raise RuntimeError("vLLM did not stream any output tokens.")
+        prompt_tokens = 0
+        if last_output is not None:
+            prompt_tokens = len(last_output.prompt_token_ids or [])
+
+        return GenerationResult(
+            text="".join(chunks).strip(),
+            token_count=token_count,
+            ttft_seconds=first_token_at - start,
+            elapsed_seconds=end - start,
+            meta={
+                "backend": "vllm",
+                "ttft_source": "stream_delta",
+                "prompt_tokens": prompt_tokens,
+            },
         )
 
     def _generate_with_dummy(

@@ -26,7 +26,8 @@ from evaluation_wrapper import GenerationConfig, VLMModel
 from PIL import Image
 
 ANSWER_RE = re.compile(
-    r"(?:answer|答案)\s*[:：]?\s*([ABCD])|^\s*([ABCD])(?:[\s\.\):：]|$)",
+    r"(?:answer|答案|正确答案)\s*(?:is|为|是)?\s*[:：]?\s*\**\s*([ABCD])"
+    r"|^\s*\**\s*([ABCD])(?:\**[\s\.\):：]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -57,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=20260625)
     parser.add_argument(
-        "--backend", choices=["auto", "dummy", "transformers"], default="auto"
+        "--backend", choices=["auto", "dummy", "transformers", "vllm"], default="auto"
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--warmup-samples", type=int, default=2)
@@ -199,63 +200,68 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     model = VLMModel(args.model_path, backend=args.backend, device=args.device)
 
-    for sample in samples[: min(args.warmup_samples, len(samples))]:
-        settle_runtime(model)
-        model.generate_with_metrics(
-            image=decode_image(sample.image_b64),
-            prompt=build_prompt(sample),
-            choices=sample.choices,
-            generation_config=fixed_generation_config(),
-            sample_id=sample.sample_id,
-        )
-        settle_runtime(model)
-
     records = []
     ttfts_ms = []
     throughputs = []
     correct = 0
     validation_errors = 0
 
-    for sample in samples:
-        settle_runtime(model)
-        config = fixed_generation_config()
-        result = model.generate_with_metrics(
-            image=decode_image(sample.image_b64),
-            prompt=build_prompt(sample),
-            choices=sample.choices,
-            generation_config=config,
-            sample_id=sample.sample_id,
-        )
-        parsed_answer = extract_answer(result.text)
-        errors = validate_public_result(
-            result.text, parsed_answer, result.token_count, config.max_new_tokens
-        )
-        validation_errors += int(bool(errors))
-        is_correct = parsed_answer == sample.answer
-        correct += int(is_correct)
+    try:
+        for sample in samples[: min(args.warmup_samples, len(samples))]:
+            settle_runtime(model)
+            model.generate_with_metrics(
+                image=decode_image(sample.image_b64),
+                prompt=build_prompt(sample),
+                choices=sample.choices,
+                generation_config=fixed_generation_config(),
+                sample_id=sample.sample_id,
+            )
+            settle_runtime(model)
 
-        ttft_ms = result.ttft_seconds * 1000.0
-        throughput = compute_throughput(
-            result.token_count, result.ttft_seconds, result.elapsed_seconds
-        )
-        if math.isfinite(ttft_ms) and ttft_ms > 0:
-            ttfts_ms.append(ttft_ms)
-        if math.isfinite(throughput) and throughput > 0:
-            throughputs.append(throughput)
+        for sample in samples:
+            settle_runtime(model)
+            config = fixed_generation_config()
+            result = model.generate_with_metrics(
+                image=decode_image(sample.image_b64),
+                prompt=build_prompt(sample),
+                choices=sample.choices,
+                generation_config=config,
+                sample_id=sample.sample_id,
+            )
+            parsed_answer = extract_answer(result.text)
+            errors = validate_public_result(
+                result.text, parsed_answer, result.token_count, config.max_new_tokens
+            )
+            validation_errors += int(bool(errors))
+            is_correct = parsed_answer == sample.answer
+            correct += int(is_correct)
 
-        records.append(
-            {
-                "question_id": sample.sample_id,
-                "parsed_answer": parsed_answer,
-                "correct": is_correct,
-                "ttft_ms": round(ttft_ms, 3),
-                "throughput_tokens_per_sec": round(throughput, 3),
-                "token_count": result.token_count,
-                "validation_errors": errors,
-                "meta": result.meta,
-            }
-        )
-        settle_runtime(model)
+            ttft_ms = result.ttft_seconds * 1000.0
+            throughput = compute_throughput(
+                result.token_count, result.ttft_seconds, result.elapsed_seconds
+            )
+            if math.isfinite(ttft_ms) and ttft_ms > 0:
+                ttfts_ms.append(ttft_ms)
+            if math.isfinite(throughput) and throughput > 0:
+                throughputs.append(throughput)
+
+            records.append(
+                {
+                    "question_id": sample.sample_id,
+                    "parsed_answer": parsed_answer,
+                    "correct": is_correct,
+                    "ttft_ms": round(ttft_ms, 3),
+                    "throughput_tokens_per_sec": round(throughput, 3),
+                    "token_count": result.token_count,
+                    "validation_errors": errors,
+                    "meta": result.meta,
+                }
+            )
+            settle_runtime(model)
+    finally:
+        shutdown = getattr(model, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
 
     elapsed = time.perf_counter() - benchmark_start
     payload = {

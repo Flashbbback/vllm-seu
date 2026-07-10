@@ -73,13 +73,16 @@ GenerationResult(
 
 在不破坏模型正确性和评测公平性的前提下，允许选手进行以下优化：
 
+- 量
+- attention、matmul、norm、sampling 等 kernel 优化。
+- KV cache 布局、分配和复用优化。
+- 图像预处理和 tokenizer 调用优化。
+
+- 投机解码
 - 模型加载方式优化，例如 dtype、device map、初始化流程优化。
 - CUDA Graph 或静态图优化。
 - 自定义算子替换。
-- attention、matmul、norm、sampling 等 kernel 优化。
-- KV cache 布局、分配和复用优化。
 - prefill/decode 路径优化。
-- 图像预处理和 tokenizer 调用优化。
 - 推理后端替换，但必须使用主办方指定的同一模型权重。
 - monkey patch 模型内部模块，但不得改变任务语义和评测接口。
 

@@ -4,3 +4,4 @@ Pillow
 numpy
 pybase64
 regex
+accelerate
