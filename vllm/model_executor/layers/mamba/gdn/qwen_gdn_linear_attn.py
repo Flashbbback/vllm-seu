@@ -31,6 +31,11 @@ from vllm.model_executor.layers.fla.ops import (
     fused_recurrent_gated_delta_rule_decode,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
+from vllm.model_executor.layers.fla.ops.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+)
+from vllm.model_executor.layers.fla.ops.chunk_fused import fused_chunk_intra
+from vllm.model_executor.layers.fla.ops.chunk_o import chunk_fwd_o
 from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
@@ -308,6 +313,8 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
+        elif envs.VLLM_PPU_FUSED_GDN_PREFILL:
+            self._forward_method = self.forward_fused
         else:
             self._forward_method = self.forward_native
 
@@ -372,6 +379,86 @@ class ChunkGatedDeltaRule(CustomOp):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             core_attn_out=core_attn_out,
         )
+
+    def forward_fused(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        """Inference-only fused GDN prefill path.
+
+        Replaces the first 4 eager FLA kernels of ``chunk_gated_delta_rule_fwd``
+        (cumsum -> scaled_dot_kkt -> solve_tril -> recompute_w_u) with the
+        single fused ``fused_chunk_intra`` kernel to cut CPU launch overhead;
+        the inter-chunk state (chunk_delta_h) and output (chunk_o) kernels are
+        reused as-is. Falls back to ``forward_native`` when the head dims are
+        unsupported by the fused kernel.
+        """
+        if use_qk_l2norm_in_kernel:
+            q = l2norm_fwd(q)
+            k = l2norm_fwd(k)
+        try:
+            w, u, g_cu = fused_chunk_intra(
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+            )
+        except ValueError as e:
+            logger.warning_once(
+                "Fused GDN prefill kernel cannot handle this input (%s). "
+                "Falling back to the unfused Triton/FLA path.",
+                e,
+            )
+            return self.forward_native(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                use_qk_l2norm_in_kernel=False,
+                core_attn_out=core_attn_out,
+            )
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g_cu,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+        )
+        o = chunk_fwd_o(
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=g_cu,
+            scale=k.shape[-1] ** -0.5,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            core_attn_out=core_attn_out,
+        )
+        return o.to(q.dtype), final_state
 
     def forward_cutedsl(
         self,
