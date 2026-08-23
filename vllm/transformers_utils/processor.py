@@ -379,6 +379,12 @@ def cached_processor_from_config(
     processor_cls: type[_P] | tuple[type[_P], ...] = ProcessorMixin,
     **kwargs: Any,
 ) -> _P:
+    from vllm.transformers_utils.kwargs_validation_cache import (
+        install_kwargs_validation_cache,
+    )
+
+    install_kwargs_validation_cache()
+
     if is_gguf(model_config.model):
         assert not is_gguf(model_config.tokenizer), (
             "For multimodal GGUF models, the original tokenizer "
