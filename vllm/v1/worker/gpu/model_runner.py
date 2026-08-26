@@ -188,6 +188,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_aux_hidden_state_outputs = False
         if self.speculative_config is not None:
             self.num_speculative_steps = self.speculative_config.num_speculative_tokens
+            if self.speculative_config.stream_output_before_drafting:
+                raise NotImplementedError(
+                    "stream_output_before_drafting is not supported by the V2 "
+                    "GPU model runner yet."
+                )
 
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
