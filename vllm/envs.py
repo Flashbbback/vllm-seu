@@ -2080,7 +2080,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use fused intra-chunk Triton kernel for GDN prefill on PPU
     "VLLM_PPU_FUSED_GDN_PREFILL": lambda: (
-        os.getenv("VLLM_PPU_FUSED_GDN_PREFILL", "False").strip().lower()
+        os.getenv("VLLM_PPU_FUSED_GDN_PREFILL", "True").strip().lower()
         in ("true", "1")
     ),
     # Use triton_int8_quant
