@@ -33,6 +33,7 @@ from torch import nn
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.compilation import CompilationMode
 from vllm.distributed import (
     get_pp_group,
 )
@@ -232,7 +233,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.mlp",
                 enable_ppu_fused_gate_silu=(
                     envs.VLLM_PPU_FUSED_GATE_SILU
-                    and bool(getattr(model_config, "enforce_eager", False))
+                    # CUDA Graph capture works without torch.compile. Keep
+                    # compiled paths disabled until FakeTensor support exists.
+                    and vllm_config.compilation_config.mode == CompilationMode.NONE
                     and vllm_config.lora_config is None
                 ),
             )
